@@ -1,0 +1,16 @@
+[package]
+name = "rds-lite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+aws-sdk-rdsdata = "1.85.0"
+axum = { version = "0.8.4", features = ["macros"] }
+chrono = { version = "0.4.41", features = ["serde"] }
+env_logger = "0.11.8"
+log = "0.4.27"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-native-tls", "macros", "migrate", "mysql", "time", "chrono"] }
+tokio = { version = "1.47.1", features = ["full"] }
