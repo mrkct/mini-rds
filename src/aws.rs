@@ -1,7 +1,12 @@
+#![allow(dead_code, clippy::enum_variant_names)]
+
 use chrono::{DateTime, Utc};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::{MySqlRow, MySqlColumn}, Column, Row, TypeInfo, types};
+use sqlx::{
+    Column, Row, TypeInfo,
+    mysql::{MySqlColumn, MySqlRow},
+};
 use std::vec::Vec;
 
 #[derive(Debug, Deserialize)]
@@ -16,8 +21,8 @@ pub struct ExecuteStatementInputDef {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SqlParameterDef {
-    pub name: Option<String>,
-    pub value: Option<FieldDef>,
+    pub name: String,
+    pub value: FieldDef,
     pub type_hint: Option<TypeHintDef>,
 }
 
@@ -41,16 +46,18 @@ impl TryFrom<MySqlRow> for VecFieldDef {
     fn try_from(row: MySqlRow) -> Result<Self, Self::Error> {
         let columns = row.columns();
         let mut values = Vec::new();
-        
+
         for column in columns {
-            let field = column_into_fielddef(&row, column)
-                .inspect_err(|e| {
-                    error!("Error converting column '{}' to FieldDef: {}", column.name(), e);
-                })?;
-            
+            let field = column_into_fielddef(&row, column).inspect_err(|e| {
+                error!(
+                    "Error converting column '{}' to FieldDef: {e}",
+                    column.name()
+                );
+            })?;
+
             values.push(field);
         }
-        
+
         Ok(VecFieldDef(values))
     }
 }
@@ -58,53 +65,51 @@ impl TryFrom<MySqlRow> for VecFieldDef {
 fn column_into_fielddef(row: &MySqlRow, column: &MySqlColumn) -> Result<FieldDef, sqlx::Error> {
     let column_name = column.name();
     let type_name = column.type_info().name();
-            
+
     let field = match type_name {
         "VARCHAR" | "CHAR" | "TEXT" | "LONGTEXT" | "MEDIUMTEXT" | "TINYTEXT" => {
             match row.try_get::<Option<String>, _>(column_name)? {
                 Some(value) => FieldDef::StringValue(value),
                 None => FieldDef::IsNull(true),
             }
-        },
-        "BOOLEAN" | "BOOL" => {
-            match row.try_get::<Option<bool>, _>(column_name)? {
-                Some(value) => FieldDef::BooleanValue(value),
-                None => FieldDef::IsNull(true),
-            }
+        }
+        "BOOLEAN" | "BOOL" => match row.try_get::<Option<bool>, _>(column_name)? {
+            Some(value) => FieldDef::BooleanValue(value),
+            None => FieldDef::IsNull(true),
         },
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => {
             match row.try_get::<Option<i64>, _>(column_name)? {
                 Some(value) => FieldDef::LongValue(value),
                 None => FieldDef::IsNull(true),
             }
-        },
+        }
         "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" => {
             match row.try_get::<Option<f64>, _>(column_name)? {
                 Some(value) => FieldDef::DoubleValue(value),
                 None => FieldDef::IsNull(true),
             }
-        },
+        }
         "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" | "YEAR" => {
             // Convert temporal types to string representation
             match row.try_get::<Option<DateTime<Utc>>, _>(column_name)? {
                 Some(value) => FieldDef::StringValue(value.to_string()),
                 None => FieldDef::IsNull(true),
             }
-        },
+        }
         "VARBINARY" | "BINARY" | "BLOB" | "LONGBLOB" | "MEDIUMBLOB" | "TINYBLOB" => {
             match row.try_get::<Option<Vec<u8>>, _>(column_name)? {
                 Some(value) => FieldDef::BlobValue(BlobDef { inner: value }),
                 None => FieldDef::IsNull(true),
             }
-        },
+        }
         _ => {
-            info!("Unknown field type for column '{}': {}", column_name, type_name);
+            info!("Unknown field type for column '{column_name}': {type_name}");
             // Try to get as string for unknown types
             match row.try_get::<Option<String>, _>(column_name)? {
                 Some(value) => FieldDef::StringValue(value),
                 None => FieldDef::IsNull(true),
             }
-        },
+        }
     };
     Ok(field)
 }
@@ -122,7 +127,7 @@ pub enum ArrayValueDef {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlobDef {
-    inner: Vec<u8>,
+    pub inner: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,4 +174,25 @@ pub struct ColumnMetadataDef {
     pub precision: i32,
     pub scale: i32,
     pub array_base_column_type: i32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchExecuteStatementInputDef {
+    pub sql: Option<String>,
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub parameter_sets: Option<Vec<Vec<SqlParameterDef>>>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchExecuteStatementOutputDef {
+    pub update_results: Option<Vec<UpdateResultDef>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateResultDef {
+    pub generated_fields: Option<Vec<FieldDef>>,
 }

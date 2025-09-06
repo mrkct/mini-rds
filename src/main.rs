@@ -3,24 +3,31 @@ use axum::{
     Router,
     extract::{Json, State},
     http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
+    routing::post,
 };
-use log::{debug, error, info, warn};
-use sqlx::{Acquire, MySqlPool, Executor, Execute};
-use std::{fmt::format, net::SocketAddr};
+use log::info;
+use sqlx::{Either, MySqlPool};
+use std::net::SocketAddr;
 
-
-use crate::aws::{ExecuteStatementInputDef, ExecuteStatementOutputDef, VecFieldDef};
+use crate::aws::{
+    BatchExecuteStatementInputDef, BatchExecuteStatementOutputDef, ExecuteStatementInputDef,
+    ExecuteStatementOutputDef,
+};
 
 mod aws;
+mod query;
+use query::run_query;
 
-// A macro that either gets a value from the struct or returns a 400 error if it's None
 macro_rules! get_or_400 {
     ($input:expr, $field:ident) => {
         match &$input.$field {
             Some(value) => value,
-            None => return Err(StatusCode::BAD_REQUEST),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Missing required field: {}", stringify!($field)),
+                ))
+            }
         }
     };
 }
@@ -28,61 +35,43 @@ macro_rules! get_or_400 {
 async fn execute_statement(
     State(pool): State<MySqlPool>,
     Json(input): Json<ExecuteStatementInputDef>,
-) -> Result<Json<ExecuteStatementOutputDef>, StatusCode> {
-    info!("Received ExecuteStatement request: {input:#?}");
-
-    // Use the same connection for all queries, because otherwise the "USE database"
-    // command might not apply to the subsequent queries
-    let mut tx = pool.begin()
-        .await
-        .inspect_err(|e| error!("Failed to acquire a database connection: {e:?}"))
-        .map_err(|_| {StatusCode::INTERNAL_SERVER_ERROR })?;
-
-    if let Some(database) = &input.database {
-        tx
-            .execute(sqlx::raw_sql(&format!("USE {database}")))
-            .await
-            .inspect_err(|e| error!("Failed to select database '{}': {e:?}", database))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-
-    if let Some(schema) = &input.schema {
-        warn!("Received 'schema={schema}' but schema selection is not implemented");
-        return Err(StatusCode::NOT_IMPLEMENTED);
-    }
-
+) -> Result<Json<ExecuteStatementOutputDef>, (StatusCode, String)> {
     let sql = get_or_400!(input, sql);
-    let _params = input
-        .parameters
-        .as_ref()
-        .map(|p| p.as_slice())
-        .unwrap_or(&[]);
+    let params = input.parameters.unwrap_or(vec![]);
 
-    let records = sqlx::query(sql)
-        .fetch_all(&mut *tx)
-        .await
-        .inspect_err(|e| error!("Failed to execute query: {e:?}"))
-        .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let output = match run_query(&pool, input.database, input.schema, sql, vec![params]).await {
+        Ok(Either::Left(records)) => ExecuteStatementOutputDef {
+            records: Some(records),
+            ..ExecuteStatementOutputDef::default()
+        },
+        Ok(Either::Right(affected_rows)) => ExecuteStatementOutputDef {
+            number_of_records_updated: affected_rows as i64,
+            ..ExecuteStatementOutputDef::default()
+        },
+        Err((status, err)) => return Err((status, err.to_string())),
+    };
 
-    tx.commit().await
-        .inspect_err(|e| warn!("Failed to commit transaction: {e:?}"))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    let records: Vec<_> = records
-        .into_iter()
-        .filter_map(|row| VecFieldDef::try_from(row).map(|x| x.0).ok())
-        .collect();
+    Ok(Json(output))
+}
 
-    debug!(
-        "Query executed successfully, fetched {} records",
-        records.len()
-    );
-    debug!("Records: {records:#?}");
+async fn batch_execute_statement(
+    State(pool): State<MySqlPool>,
+    Json(input): Json<BatchExecuteStatementInputDef>,
+) -> Result<Json<BatchExecuteStatementOutputDef>, (StatusCode, String)> {
+    let sql = get_or_400!(input, sql);
+    let params = input.parameter_sets.unwrap_or(vec![]);
 
-    Ok(Json(ExecuteStatementOutputDef {
-        records: Some(records),
-        ..ExecuteStatementOutputDef::default()
-    }))
+    let output = match run_query(&pool, input.database, input.schema, sql, params).await {
+        Ok(Either::Left(_records)) => BatchExecuteStatementOutputDef {
+            ..BatchExecuteStatementOutputDef::default()
+        },
+        Ok(Either::Right(_affected_rows)) => BatchExecuteStatementOutputDef {
+            ..BatchExecuteStatementOutputDef::default()
+        },
+        Err((status, err)) => return Err((status, err.to_string())),
+    };
+
+    Ok(Json(output))
 }
 
 #[tokio::main]
@@ -97,6 +86,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/Execute", post(execute_statement))
+        .route("/BatchExecute", post(batch_execute_statement))
         .with_state(pool);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
