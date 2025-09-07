@@ -1,13 +1,9 @@
 #![allow(dead_code, clippy::enum_variant_names)]
 
-use base64::Engine;
-use chrono::{DateTime, Utc};
-use log::{error, info};
+/// Definitions for AWS RDS Data Service API
+/// Manually copy-pasted from the aws-sdk-rdsdata create, stripped of needless fields
+/// and adapted for usage with serde.
 use serde::{Deserialize, Serialize};
-use sqlx::{
-    Column, Row, TypeInfo,
-    mysql::{MySqlColumn, MySqlRow},
-};
 use std::vec::Vec;
 
 #[derive(Debug, Deserialize)]
@@ -37,80 +33,6 @@ pub enum FieldDef {
     IsNull(bool),
     LongValue(i64),
     StringValue(String),
-}
-
-pub fn try_row_to_aws_fields(row: MySqlRow) -> Result<Vec<FieldDef>, sqlx::Error> {
-    let columns = row.columns();
-    let mut values = Vec::new();
-
-    for column in columns {
-        let field = column_into_fielddef(&row, column).inspect_err(|e| {
-            error!(
-                "Error converting column '{}' to FieldDef: {e}",
-                column.name()
-            );
-        })?;
-
-        values.push(field);
-    }
-
-    Ok(values)
-}
-
-fn column_into_fielddef(row: &MySqlRow, column: &MySqlColumn) -> Result<FieldDef, sqlx::Error> {
-    let column_name = column.name();
-    let type_name = column.type_info().name();
-
-    let field = match type_name {
-        "VARCHAR" | "CHAR" | "TEXT" | "LONGTEXT" | "MEDIUMTEXT" | "TINYTEXT" => {
-            match row.try_get::<Option<String>, _>(column_name)? {
-                Some(value) => FieldDef::StringValue(value),
-                None => FieldDef::IsNull(true),
-            }
-        }
-        "BOOLEAN" | "BOOL" => match row.try_get::<Option<bool>, _>(column_name)? {
-            Some(value) => FieldDef::BooleanValue(value),
-            None => FieldDef::IsNull(true),
-        },
-        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => {
-            match row.try_get::<Option<i64>, _>(column_name)? {
-                Some(value) => FieldDef::LongValue(value),
-                None => FieldDef::IsNull(true),
-            }
-        }
-        "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" => {
-            match row.try_get::<Option<f64>, _>(column_name)? {
-                Some(value) => FieldDef::DoubleValue(value),
-                None => FieldDef::IsNull(true),
-            }
-        }
-        "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" | "YEAR" => {
-            // Convert temporal types to string representation
-            match row.try_get::<Option<DateTime<Utc>>, _>(column_name)? {
-                Some(value) => FieldDef::StringValue(value.to_string()),
-                None => FieldDef::IsNull(true),
-            }
-        }
-        "VARBINARY" | "BINARY" | "BLOB" | "LONGBLOB" | "MEDIUMBLOB" | "TINYBLOB" => {
-            match row.try_get::<Option<Vec<u8>>, _>(column_name)? {
-                Some(value) => {
-                    // Encode to base64 string
-                    let value = base64::engine::general_purpose::STANDARD.encode(&value);
-                    FieldDef::BlobValue(value)
-                }
-                None => FieldDef::IsNull(true),
-            }
-        }
-        _ => {
-            info!("Unknown field type for column '{column_name}': {type_name}");
-            // Try to get as string for unknown types
-            match row.try_get::<Option<String>, _>(column_name)? {
-                Some(value) => FieldDef::StringValue(value),
-                None => FieldDef::IsNull(true),
-            }
-        }
-    };
-    Ok(field)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
