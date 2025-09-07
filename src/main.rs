@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     routing::post,
 };
-use log::info;
+use log::{error, info};
 use sqlx::{Either, MySqlPool};
 use std::net::SocketAddr;
 
@@ -48,7 +48,10 @@ async fn execute_statement(
             number_of_records_updated: affected_rows as i64,
             ..ExecuteStatementOutputDef::default()
         },
-        Err((status, err)) => return Err((status, err.to_string())),
+        Err((status, err)) => {
+            error!("Error executing statement: {err}");
+            return Err((status, err.to_string()));
+        }
     };
 
     Ok(Json(output))

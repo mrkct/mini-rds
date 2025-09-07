@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use anyhow::anyhow;
 use axum::http::StatusCode;
+use base64::Engine as _;
 use log::{error, warn};
 use sqlx::{Either, Executor, MySql, MySqlPool, mysql::MySqlArguments, query::Query};
 
-use crate::aws::{BlobDef, FieldDef, SqlParameterDef, VecFieldDef};
+use crate::aws::{FieldDef, SqlParameterDef, try_row_to_aws_fields};
 
 const MAX_SQL_LEN: usize = 65536;
 
@@ -128,7 +129,17 @@ fn bind_parameters<'q>(
             FieldDef::ArrayValue(_) => {
                 return Err(anyhow!("Array parameters are not supported"));
             }
-            FieldDef::BlobValue(BlobDef { inner }) => query.bind(inner.as_slice()),
+            FieldDef::BlobValue(b64) => {
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| {
+                        anyhow!(
+                            "Failed to decode base64 blob for parameter '{}': {e}",
+                            arg.name
+                        )
+                    })?;
+                query.bind(data)
+            }
             FieldDef::BooleanValue(x) => query.bind(*x),
             FieldDef::DoubleValue(x) => query.bind(*x),
             FieldDef::IsNull(_) => query.bind(None::<String>),
@@ -199,7 +210,7 @@ pub async fn run_query(
             collected_records.extend(
                 records
                     .into_iter()
-                    .filter_map(|row| VecFieldDef::try_from(row).map(|x| x.0).ok()),
+                    .filter_map(|row| try_row_to_aws_fields(row).ok()),
             );
         }
 

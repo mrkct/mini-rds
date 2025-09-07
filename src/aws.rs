@@ -1,5 +1,6 @@
 #![allow(dead_code, clippy::enum_variant_names)]
 
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ pub struct SqlParameterDef {
 #[serde(rename_all = "camelCase")]
 pub enum FieldDef {
     ArrayValue(ArrayValueDef),
-    BlobValue(BlobDef),
+    BlobValue(String),
     BooleanValue(bool),
     DoubleValue(f64),
     IsNull(bool),
@@ -38,28 +39,22 @@ pub enum FieldDef {
     StringValue(String),
 }
 
-pub struct VecFieldDef(pub Vec<FieldDef>);
+pub fn try_row_to_aws_fields(row: MySqlRow) -> Result<Vec<FieldDef>, sqlx::Error> {
+    let columns = row.columns();
+    let mut values = Vec::new();
 
-impl TryFrom<MySqlRow> for VecFieldDef {
-    type Error = sqlx::Error;
+    for column in columns {
+        let field = column_into_fielddef(&row, column).inspect_err(|e| {
+            error!(
+                "Error converting column '{}' to FieldDef: {e}",
+                column.name()
+            );
+        })?;
 
-    fn try_from(row: MySqlRow) -> Result<Self, Self::Error> {
-        let columns = row.columns();
-        let mut values = Vec::new();
-
-        for column in columns {
-            let field = column_into_fielddef(&row, column).inspect_err(|e| {
-                error!(
-                    "Error converting column '{}' to FieldDef: {e}",
-                    column.name()
-                );
-            })?;
-
-            values.push(field);
-        }
-
-        Ok(VecFieldDef(values))
+        values.push(field);
     }
+
+    Ok(values)
 }
 
 fn column_into_fielddef(row: &MySqlRow, column: &MySqlColumn) -> Result<FieldDef, sqlx::Error> {
@@ -98,7 +93,11 @@ fn column_into_fielddef(row: &MySqlRow, column: &MySqlColumn) -> Result<FieldDef
         }
         "VARBINARY" | "BINARY" | "BLOB" | "LONGBLOB" | "MEDIUMBLOB" | "TINYBLOB" => {
             match row.try_get::<Option<Vec<u8>>, _>(column_name)? {
-                Some(value) => FieldDef::BlobValue(BlobDef { inner: value }),
+                Some(value) => {
+                    // Encode to base64 string
+                    let value = base64::engine::general_purpose::STANDARD.encode(&value);
+                    FieldDef::BlobValue(value)
+                }
                 None => FieldDef::IsNull(true),
             }
         }
@@ -122,12 +121,6 @@ pub enum ArrayValueDef {
     DoubleValues(Vec<f64>),
     LongValues(Vec<i64>),
     StringValues(Vec<String>),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BlobDef {
-    pub inner: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
