@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use axum::http::StatusCode;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use log::{error, info, warn};
+use log::{error, info};
 use sqlx::{Column, Row, TypeInfo};
 use sqlx::{
     Either, Executor, MySql, MySqlPool,
@@ -90,99 +90,124 @@ fn column_into_fielddef(row: &MySqlRow, column: &MySqlColumn) -> Result<FieldDef
     Ok(field)
 }
 
-fn tokenize_query(sql: &str) -> Vec<&str> {
-    fn parse_quoted_string<'a>(
-        sql: &'a str,
-        chars: &mut std::iter::Peekable<std::str::CharIndices>,
-        start_idx: usize,
-        quote_char: char,
-    ) -> &'a str {
-        let mut end_idx = start_idx + 1;
-
-        while let Some((idx, ch)) = chars.next() {
-            if ch == quote_char {
-                end_idx = idx + ch.len_utf8();
-                break;
-            } else if ch == '\\' {
-                // Handle backslash escaping - consume the next character
-                end_idx = idx + ch.len_utf8();
-                if let Some((idx, next_ch)) = chars.next() {
-                    end_idx = idx + next_ch.len_utf8();
-                }
-            } else {
-                end_idx = idx + ch.len_utf8();
-            }
-        }
-
-        &sql[start_idx..end_idx]
+/// Rewrite named parameters (e.g., :id) to positional placeholders ('?') while preserving
+/// all other SQL characters and whitespace exactly. Returns the rewritten SQL and the ordered
+/// list of parameter names.
+fn rewrite_named_params_preserving_sql(sql: &str) -> (String, Vec<String>) {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum State {
+        Normal,
+        Quoted(char), // quote delimiter: '\'', '"', or '`'
+        LineComment,  // -- ... or # ...
+        BlockComment, // /* ... */
     }
 
-    const SPECIAL_CHARS: &str = "=><!+-*/%(),;";
+    let mut out = String::with_capacity(sql.len());
+    let mut args = Vec::<String>::new();
+    let mut state = State::Normal;
+    let mut chars = sql.chars().peekable();
 
-    let sql = sql.trim();
-
-    let mut tokens = Vec::new();
-    let mut chars = sql.char_indices().peekable();
-
-    while let Some((start_idx, ch)) = chars.next() {
-        match ch {
-            ch if ch.is_whitespace() => continue,
-            ch if SPECIAL_CHARS.contains(ch) => {
-                tokens.push(&sql[start_idx..start_idx + ch.len_utf8()]);
-            }
-
-            // Quoted strings (single quotes, double quotes, backticks)
-            '\'' | '"' | '`' => {
-                let quoted_string = parse_quoted_string(sql, &mut chars, start_idx, ch);
-                tokens.push(quoted_string);
-            }
-
-            // Regular tokens (identifiers, keywords, numbers)
-            _ => {
-                let token_start = start_idx;
-                let mut end_idx = start_idx + ch.len_utf8();
-
-                // Continue until we hit whitespace or a special character
-                while let Some(&(idx, next_ch)) = chars.peek() {
-                    match next_ch {
-                        ch if ch.is_whitespace() => break,
-                        '\'' | '"' | '`' => break,
-                        ch if SPECIAL_CHARS.contains(ch) => break,
-                        _ => {
-                            chars.next();
-                            end_idx = idx + next_ch.len_utf8();
-                        }
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Normal => match ch {
+                '\'' | '"' | '`' => {
+                    out.push(ch);
+                    state = State::Quoted(ch);
+                }
+                '-' => {
+                    if matches!(chars.peek(), Some('-')) {
+                        out.push('-');
+                        out.push('-');
+                        chars.next();
+                        state = State::LineComment;
+                    } else {
+                        out.push('-');
                     }
                 }
-
-                let token = &sql[token_start..end_idx];
-                if !token.is_empty() {
-                    tokens.push(token);
+                '#' => {
+                    out.push('#');
+                    state = State::LineComment;
+                }
+                '/' => {
+                    if matches!(chars.peek(), Some('*')) {
+                        out.push('/');
+                        out.push('*');
+                        chars.next();
+                        state = State::BlockComment;
+                    } else {
+                        out.push('/');
+                    }
+                }
+                ':' => {
+                    // Only treat as a named parameter if next char starts a valid identifier
+                    let mut clone = chars.clone();
+                    if let Some(nc) = clone.peek().copied() {
+                        if nc == '_' || nc.is_ascii_alphabetic() {
+                            // consume identifier
+                            let mut name = String::new();
+                            while let Some(&c) = clone.peek() {
+                                if c == '_' || c.is_ascii_alphanumeric() {
+                                    name.push(c);
+                                    clone.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !name.is_empty() {
+                                // commit consumption
+                                for _ in 0..name.len() {
+                                    chars.next();
+                                }
+                                out.push('?');
+                                args.push(name);
+                                continue;
+                            }
+                        }
+                    }
+                    // Not a named param, just output ':'
+                    out.push(':');
+                }
+                _ => out.push(ch),
+            },
+            State::Quoted(delim) => {
+                out.push(ch);
+                match ch {
+                    // backslash escapes inside quoted strings
+                    '\\' if delim != '`' => {
+                        if let Some(next) = chars.next() {
+                            out.push(next);
+                        }
+                    }
+                    // doubled delimiter ('' or "" or ``) as escape: copy both and stay quoted
+                    _ if ch == delim => {
+                        if matches!(chars.peek(), Some(&c) if c == delim) {
+                            out.push(delim);
+                            chars.next();
+                        } else {
+                            state = State::Normal;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            State::LineComment => {
+                out.push(ch);
+                if ch == '\n' {
+                    state = State::Normal;
+                }
+            }
+            State::BlockComment => {
+                out.push(ch);
+                if ch == '*' && matches!(chars.peek(), Some('/')) {
+                    out.push('/');
+                    chars.next();
+                    state = State::Normal;
                 }
             }
         }
     }
 
-    tokens
-}
-
-fn make_prepared_statement(tokens: Vec<&str>) -> (String, Vec<&str>) {
-    let mut prepared_query = String::new();
-    let mut args = vec![];
-
-    for token in tokens {
-        let mut chars = token.chars();
-        if let Some(':') = chars.next() {
-            // Named parameter
-            prepared_query.push('?');
-            args.push(&token[1..]);
-        } else {
-            prepared_query.push_str(token);
-        }
-        prepared_query.push(' ');
-    }
-
-    (prepared_query.trim_end().to_string(), args)
+    (out, args)
 }
 
 fn bind_parameters<'q>(
@@ -248,14 +273,14 @@ pub async fn run_query(
 
     // Use the same connection for all queries, because otherwise the "USE database"
     // command might not apply to the subsequent queries
-    let mut tx = pool
-        .begin()
+    let mut conn = pool
+        .acquire()
         .await
         .inspect_err(|e| error!("Failed to acquire a database connection: {e:?}"))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
     if let Some(database) = &database {
-        tx.execute(sqlx::raw_sql(&format!("USE {database}")))
+        conn.execute(sqlx::raw_sql(&format!("USE {database}")))
             .await
             .inspect_err(|e| error!("Failed to select database '{database}': {e:?}"))
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
@@ -268,21 +293,20 @@ pub async fn run_query(
         ));
     }
 
-    let query_tokens = tokenize_query(sql);
-    let (prepared_sql, args_to_be_bound) = make_prepared_statement(query_tokens.clone());
+    let (prepared_sql, args_to_be_bound) = rewrite_named_params_preserving_sql(sql);
+    info!("Running '{prepared_sql}' with {} parameters", params.len());
 
-    let value = if let Some(first) = query_tokens.first()
-        && first.eq_ignore_ascii_case("SELECT")
-    {
+    let value = if sql.trim_start().to_ascii_uppercase().starts_with("SELECT") {
         let mut collected_records = vec![];
 
         for row_params in params {
             let query = sqlx::query(&prepared_sql);
-            let query = bind_parameters(query, &args_to_be_bound, &row_params)
+            let arg_refs: Vec<&str> = args_to_be_bound.iter().map(|s| s.as_str()).collect();
+            let query = bind_parameters(query, &arg_refs, &row_params)
                 .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
             let records = query
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut *conn)
                 .await
                 .inspect_err(|e| error!("Failed to execute query: {e:?}"))
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
@@ -299,11 +323,12 @@ pub async fn run_query(
         let mut affected_rows = 0;
         for row_params in params {
             let query = sqlx::query(&prepared_sql);
-            let query = bind_parameters(query, &args_to_be_bound, &row_params)
+            let arg_refs: Vec<&str> = args_to_be_bound.iter().map(|s| s.as_str()).collect();
+            let query = bind_parameters(query, &arg_refs, &row_params)
                 .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
             affected_rows += query
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await
                 .inspect_err(|e| error!("Failed to execute query: {e:?}"))
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -313,11 +338,6 @@ pub async fn run_query(
         Either::Right(affected_rows)
     };
 
-    tx.commit()
-        .await
-        .inspect_err(|e| warn!("Failed to commit transaction: {e:?}"))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
-
     Ok(value)
 }
 
@@ -326,199 +346,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tokenize_query() {
-        let sql = r#"SELECT * FROM table WHERE name = 'Marco' AND age > 30"#;
-        let tokens = tokenize_query(sql);
+    fn test_rewrite_named_params_simple() {
+        let sql = "SELECT * FROM t WHERE id = :id AND name = :name";
+        let (rewritten, args) = rewrite_named_params_preserving_sql(sql);
+        assert_eq!(rewritten, "SELECT * FROM t WHERE id = ? AND name = ?");
+        assert_eq!(args, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn test_rewrite_named_params_colon_in_string() {
+        let sql = r#"SELECT ':notparam' AS s, col FROM t WHERE a = :a"#;
+        let (rewritten, args) = rewrite_named_params_preserving_sql(sql);
         assert_eq!(
-            tokens,
-            vec![
-                "SELECT", "*", "FROM", "table", "WHERE", "name", "=", "'Marco'", "AND", "age", ">",
-                "30"
-            ]
+            rewritten,
+            r#"SELECT ':notparam' AS s, col FROM t WHERE a = ?"#
         );
+        assert_eq!(args, vec!["a"]);
     }
 
     #[test]
-    fn test_tokenize_query_escaped_quote() {
-        let sql = r#"SELECT * FROM table WHERE description = 'It\'s a test'"#;
-        let tokens = tokenize_query(sql);
+    fn test_rewrite_named_params_comments() {
+        let sql = "-- :skip one\nSELECT :x /* :skip two */ , :y # :skip three\nFROM t";
+        let (rewritten, args) = rewrite_named_params_preserving_sql(sql);
         assert_eq!(
-            tokens,
-            vec![
-                "SELECT",
-                "*",
-                "FROM",
-                "table",
-                "WHERE",
-                "description",
-                "=",
-                r#"'It\'s a test'"#
-            ]
+            rewritten,
+            "-- :skip one\nSELECT ? /* :skip two */ , ? # :skip three\nFROM t"
         );
+        assert_eq!(args, vec!["x", "y"]);
     }
 
     #[test]
-    fn test_tokenize_query_different_quotes() {
-        let sql = r#"SELECT * FROM table WHERE note = "He said, 'Hello'""#;
-        let tokens = tokenize_query(sql);
-        assert_eq!(
-            tokens,
-            vec![
-                "SELECT",
-                "*",
-                "FROM",
-                "table",
-                "WHERE",
-                "note",
-                "=",
-                r#""He said, 'Hello'""#
-            ]
-        );
+    fn test_rewrite_named_params_mysql_literals_preserved() {
+        let sql = "INSERT INTO t (a,b,c,d) VALUES (x'1234', b'1010', _utf8mb4'hé', :p)";
+        let (rewritten, args) = rewrite_named_params_preserving_sql(sql);
+        assert!(rewritten.contains("x'1234', b'1010', _utf8mb4'hé'"));
+        assert!(rewritten.ends_with(", ?)"));
+        assert_eq!(args, vec!["p"]);
     }
 
     #[test]
-    fn test_tokenize_query_whitespace() {
-        let sql = "  SELECT   *  FROM   table  ";
-        let tokens = tokenize_query(sql);
-        assert_eq!(tokens, vec!["SELECT", "*", "FROM", "table"]);
-    }
-
-    #[test]
-    fn test_tokenize_query_backticks() {
-        let sql = r#"SELECT * FROM `my table` WHERE `column name` = 'value'"#;
-        let tokens = tokenize_query(sql);
-        assert_eq!(
-            tokens,
-            vec![
-                "SELECT",
-                "*",
-                "FROM",
-                "`my table`",
-                "WHERE",
-                "`column name`",
-                "=",
-                "'value'"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_tokenize_query_escaped_backticks() {
-        let sql = r#"SELECT * FROM `table\`name` WHERE id = 1"#;
-        let tokens = tokenize_query(sql);
-        assert_eq!(
-            tokens,
-            vec![
-                "SELECT",
-                "*",
-                "FROM",
-                "`table\\`name`",
-                "WHERE",
-                "id",
-                "=",
-                "1"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_make_prepared_statement_no_params() {
-        let tokens = vec!["SELECT", "*", "FROM", "table"];
-        let (prepared_sql, args) = make_prepared_statement(tokens);
-        assert_eq!(prepared_sql, "SELECT * FROM table");
-        assert_eq!(args, Vec::<&str>::new());
-    }
-
-    #[test]
-    fn test_make_prepared_statement_single_param() {
-        let tokens = vec!["SELECT", "*", "FROM", "table", "WHERE", "id", "=", ":id"];
-        let (prepared_sql, args) = make_prepared_statement(tokens);
-        assert_eq!(prepared_sql, "SELECT * FROM table WHERE id = ?");
-        assert_eq!(args, vec!["id"]);
-    }
-
-    #[test]
-    fn test_make_prepared_statement_multiple_params() {
-        let tokens = vec![
-            "SELECT", "*", "FROM", "table", "WHERE", "name", "=", ":name", "AND", "age", ">",
-            ":age",
-        ];
-        let (prepared_sql, args) = make_prepared_statement(tokens);
-        assert_eq!(
-            prepared_sql,
-            "SELECT * FROM table WHERE name = ? AND age > ?"
-        );
-        assert_eq!(args, vec!["name", "age"]);
-    }
-
-    #[test]
-    fn test_make_prepared_statement_repeated_param() {
-        let tokens = vec![
-            "SELECT",
-            "*",
-            "FROM",
-            "table",
-            "WHERE",
-            "status",
-            "=",
-            ":status",
-            "OR",
-            "backup_status",
-            "=",
-            ":status",
-        ];
-        let (prepared_sql, args) = make_prepared_statement(tokens);
-        assert_eq!(
-            prepared_sql,
-            "SELECT * FROM table WHERE status = ? OR backup_status = ?"
-        );
-        assert_eq!(args, vec!["status", "status"]);
-    }
-
-    #[test]
-    fn test_make_prepared_statement_mixed_content() {
-        let tokens = vec![
-            "INSERT", "INTO", "users", "(", "name", ",", "email", ")", "VALUES", "(", ":name", ",",
-            ":email", ")",
-        ];
-        let (prepared_sql, args) = make_prepared_statement(tokens);
-        assert_eq!(
-            prepared_sql,
-            "INSERT INTO users ( name , email ) VALUES ( ? , ? )"
-        );
-        assert_eq!(args, vec!["name", "email"]);
-    }
-
-    #[test]
-    fn test_make_prepared_statement_colon_in_string() {
-        // Test that colons inside quoted strings are not treated as parameters
-        let tokens = vec![
-            "SELECT",
-            "*",
-            "FROM",
-            "table",
-            "WHERE",
-            "note",
-            "=",
-            "'time:12:00'",
-            "AND",
-            "id",
-            "=",
-            ":id",
-        ];
-        let (prepared_sql, args) = make_prepared_statement(tokens);
-        assert_eq!(
-            prepared_sql,
-            "SELECT * FROM table WHERE note = 'time:12:00' AND id = ?"
-        );
-        assert_eq!(args, vec!["id"]);
-    }
-
-    #[test]
-    fn test_make_prepared_statement_empty_param_name() {
-        let tokens = vec!["SELECT", "*", "FROM", "table", "WHERE", "id", "=", ":"];
-        let (prepared_sql, args) = make_prepared_statement(tokens);
-        assert_eq!(prepared_sql, "SELECT * FROM table WHERE id = ?");
-        assert_eq!(args, vec![""]);
+    fn test_rewrite_named_params_non_identifier_after_colon() {
+        let sql = "SELECT ':' AS c, :1 AS not_param";
+        let (rewritten, args) = rewrite_named_params_preserving_sql(sql);
+        assert_eq!(rewritten, "SELECT ':' AS c, :1 AS not_param");
+        assert!(args.is_empty());
     }
 }
