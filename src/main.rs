@@ -79,12 +79,13 @@ async fn batch_execute_statement(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .init();
+    env_logger::Builder::from_env("RUST_LOG").init();
 
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:my-secret-password@localhost:3306".to_string());
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse()
+        .expect("PORT must be a valid u16 number");
+    let url = std::env::var("DATABASE_URL").expect("Missing required env var DATABASE_URL");
     let pool = MySqlPool::connect(&url).await?;
 
     let app = Router::new()
@@ -92,7 +93,7 @@ async fn main() -> Result<()> {
         .route("/BatchExecute", post(batch_execute_statement))
         .with_state(pool);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     info!("Listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app)
