@@ -6,6 +6,7 @@ use axum::{
     routing::post,
 };
 use log::{error, info};
+use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{Either, MySqlPool};
 use std::net::SocketAddr;
 
@@ -86,14 +87,17 @@ async fn main() -> Result<()> {
         .parse()
         .expect("PORT must be a valid u16 number");
     let url = std::env::var("DATABASE_URL").expect("Missing required env var DATABASE_URL");
-    let pool = MySqlPool::connect(&url).await?;
+    // Use a lazy pool so the server can start immediately
+    let pool = MySqlPoolOptions::new()
+        .connect_lazy(&url)
+        .expect("Invalid DATABASE_URL");
 
     let app = Router::new()
         .route("/Execute", post(execute_statement))
         .route("/BatchExecute", post(batch_execute_statement))
         .with_state(pool);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app)
