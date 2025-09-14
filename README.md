@@ -5,6 +5,8 @@ This software simulates a minuscule subset of the AWS RDS Data API, running the 
 Only the ExecuteStatement and BatchExecuteStatement API calls are supported, and only their happy path are supported.
 Chances are it's missing something you need.
 
+A docker image is available at `ghcr.io/mrkct/mini-rds:latest`
+
 ## Usage
 
 You should first ensure you have a MySQL database that rds-lite can access
