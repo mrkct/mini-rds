@@ -1,0 +1,13 @@
+target
+.git
+.gitignore
+**/*.rs.bk
+**/*.swp
+**/*.swp~
+**/.DS_Store
+**/Thumbs.db
+**/.idea
+**/.vscode
+**/node_modules
+**/dist
+**/build
