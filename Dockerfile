@@ -1,4 +1,5 @@
-FROM rust:1.89-bookworm AS build
+FROM rust:1.90-trixie AS build
+
 
 WORKDIR /app
 
