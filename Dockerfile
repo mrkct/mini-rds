@@ -1,5 +1,8 @@
 FROM rust:1.90-trixie AS build
 
+# Add build platform argument for multi-arch support
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
 
 WORKDIR /app
 
@@ -13,6 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
     && cargo build --release
 
 FROM debian:bookworm-slim AS runtime
+
+# Add build platform argument for multi-arch support
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
